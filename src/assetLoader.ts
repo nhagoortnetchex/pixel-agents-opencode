@@ -123,16 +123,20 @@ function pngToSpriteData(pngBuffer: Buffer, width: number, height: number): stri
 
     if (png.width !== width || png.height !== height) {
       console.warn(
-        `PNG dimensions mismatch: expected ${width}×${height}, got ${png.width}×${png.height}`,
+        `PNG dimensions mismatch: expected ${width}×${height}, got ${png.width}×${png.height}. Using actual PNG dimensions.`,
       );
     }
+
+    // Use actual PNG dimensions to avoid out-of-bounds reads when metadata is wrong
+    const safeW = Math.min(width, png.width);
+    const safeH = Math.min(height, png.height);
 
     const sprite: string[][] = [];
     const data = png.data; // Uint8Array with RGBA values
 
-    for (let y = 0; y < height; y++) {
+    for (let y = 0; y < safeH; y++) {
       const row: string[] = [];
-      for (let x = 0; x < width; x++) {
+      for (let x = 0; x < safeW; x++) {
         const pixelIndex = (y * png.width + x) * 4;
 
         const r = data[pixelIndex];
@@ -150,8 +154,10 @@ function pngToSpriteData(pngBuffer: Buffer, width: number, height: number): stri
           row.push(hex);
         }
       }
+      while (row.length < width) row.push('');
       sprite.push(row);
     }
+    while (sprite.length < height) sprite.push(new Array(width).fill(''));
 
     return sprite;
   } catch (err) {

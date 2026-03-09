@@ -1,40 +1,33 @@
-import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
 import {
-  JSONL_POLL_INTERVAL_MS,
+  RESTORE_LOOKBACK_MS,
+  SESSION_DISCOVERY_INTERVAL_MS,
   TERMINAL_NAME_PREFIX,
   WORKSPACE_KEY_AGENT_SEATS,
   WORKSPACE_KEY_AGENTS,
 } from './constants.js';
-import { ensureProjectScan, readNewLines, startFileWatching } from './fileWatcher.js';
+import {
+  discoverMostRecentSession,
+  discoverSessions,
+  initDbPoller,
+  startDbPolling,
+  stopDbPolling,
+} from './dbPoller.js';
 import { migrateAndLoadLayout } from './layoutPersistence.js';
 import { cancelPermissionTimer, cancelWaitingTimer } from './timerManager.js';
 import type { AgentState, PersistedAgent } from './types.js';
-
-export function getProjectDirPath(cwd?: string): string | null {
-  const workspacePath = cwd || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!workspacePath) return null;
-  const dirName = workspacePath.replace(/[^a-zA-Z0-9-]/g, '-');
-  const projectDir = path.join(os.homedir(), '.claude', 'projects', dirName);
-  console.log(`[Pixel Agents] Project dir: ${workspacePath} → ${dirName}`);
-  return projectDir;
-}
 
 export async function launchNewTerminal(
   nextAgentIdRef: { current: number },
   nextTerminalIndexRef: { current: number },
   agents: Map<number, AgentState>,
   activeAgentIdRef: { current: number | null },
-  knownJsonlFiles: Set<string>,
-  fileWatchers: Map<number, fs.FSWatcher>,
-  pollingTimers: Map<number, ReturnType<typeof setInterval>>,
   waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
   permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
-  jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
-  projectScanTimerRef: { current: ReturnType<typeof setInterval> | null },
+  pollTimers: Map<number, ReturnType<typeof setInterval>>,
+  sessionDiscoveryTimerRef: { current: ReturnType<typeof setInterval> | null },
   webview: vscode.Webview | undefined,
   persistAgents: () => void,
   folderPath?: string,
@@ -48,30 +41,19 @@ export async function launchNewTerminal(
     cwd,
   });
   terminal.show();
+  terminal.sendText('opencode');
 
-  const sessionId = crypto.randomUUID();
-  terminal.sendText(`claude --session-id ${sessionId}`);
+  await initDbPoller();
 
-  const projectDir = getProjectDirPath(cwd);
-  if (!projectDir) {
-    console.log(`[Pixel Agents] No project dir, cannot track agent`);
-    return;
-  }
-
-  // Pre-register expected JSONL file so project scan won't treat it as a /clear file
-  const expectedFile = path.join(projectDir, `${sessionId}.jsonl`);
-  knownJsonlFiles.add(expectedFile);
-
-  // Create agent immediately (before JSONL file exists)
+  const launchTime = Date.now();
   const id = nextAgentIdRef.current++;
   const folderName = isMultiRoot && cwd ? path.basename(cwd) : undefined;
   const agent: AgentState = {
     id,
     terminalRef: terminal,
-    projectDir,
-    jsonlFile: expectedFile,
-    fileOffset: 0,
-    lineBuffer: '',
+    sessionId: '',
+    lastPartTime: launchTime,
+    lastSeenPartIds: new Set(),
     activeToolIds: new Set(),
     activeToolStatuses: new Map(),
     activeToolNames: new Map(),
@@ -89,88 +71,43 @@ export async function launchNewTerminal(
   console.log(`[Pixel Agents] Agent ${id}: created for terminal ${terminal.name}`);
   webview?.postMessage({ type: 'agentCreated', id, folderName });
 
-  ensureProjectScan(
-    projectDir,
-    knownJsonlFiles,
-    projectScanTimerRef,
-    activeAgentIdRef,
-    nextAgentIdRef,
-    agents,
-    fileWatchers,
-    pollingTimers,
-    waitingTimers,
-    permissionTimers,
-    webview,
-    persistAgents,
-  );
-
-  // Poll for the specific JSONL file to appear
-  const pollTimer = setInterval(() => {
-    try {
-      if (fs.existsSync(agent.jsonlFile)) {
-        console.log(
-          `[Pixel Agents] Agent ${id}: found JSONL file ${path.basename(agent.jsonlFile)}`,
-        );
-        clearInterval(pollTimer);
-        jsonlPollTimers.delete(id);
-        startFileWatching(
-          id,
-          agent.jsonlFile,
-          agents,
-          fileWatchers,
-          pollingTimers,
-          waitingTimers,
-          permissionTimers,
-          webview,
-        );
-        readNewLines(id, agents, waitingTimers, permissionTimers, webview);
-      }
-    } catch {
-      /* file may not exist yet */
+  const discoveryTimer = setInterval(() => {
+    if (!agents.has(id)) {
+      clearInterval(discoveryTimer);
+      return;
     }
-  }, JSONL_POLL_INTERVAL_MS);
-  jsonlPollTimers.set(id, pollTimer);
+    if (agent.sessionId) return;
+
+    const workspaceDir = cwd || '';
+    const sessions = discoverSessions(workspaceDir);
+    const newSession = sessions.find((s) => s.timeCreated >= launchTime);
+
+    if (newSession) {
+      agent.sessionId = newSession.id;
+      agent.lastPartTime = launchTime;
+      console.log(`[Pixel Agents] Agent ${id}: discovered session ${newSession.id}`);
+      persistAgents();
+      startDbPolling(id, agents, waitingTimers, permissionTimers, pollTimers, webview);
+    }
+  }, SESSION_DISCOVERY_INTERVAL_MS);
+  sessionDiscoveryTimerRef.current = discoveryTimer;
 }
 
 export function removeAgent(
   agentId: number,
   agents: Map<number, AgentState>,
-  fileWatchers: Map<number, fs.FSWatcher>,
-  pollingTimers: Map<number, ReturnType<typeof setInterval>>,
   waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
   permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
-  jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
+  pollTimers: Map<number, ReturnType<typeof setInterval>>,
   persistAgents: () => void,
 ): void {
   const agent = agents.get(agentId);
   if (!agent) return;
 
-  // Stop JSONL poll timer
-  const jpTimer = jsonlPollTimers.get(agentId);
-  if (jpTimer) {
-    clearInterval(jpTimer);
-  }
-  jsonlPollTimers.delete(agentId);
-
-  // Stop file watching
-  fileWatchers.get(agentId)?.close();
-  fileWatchers.delete(agentId);
-  const pt = pollingTimers.get(agentId);
-  if (pt) {
-    clearInterval(pt);
-  }
-  pollingTimers.delete(agentId);
-  try {
-    fs.unwatchFile(agent.jsonlFile);
-  } catch {
-    /* ignore */
-  }
-
-  // Cancel timers
+  stopDbPolling(agentId, pollTimers);
   cancelWaitingTimer(agentId, waitingTimers);
   cancelPermissionTimer(agentId, permissionTimers);
 
-  // Remove from maps
   agents.delete(agentId);
   persistAgents();
 }
@@ -184,37 +121,30 @@ export function persistAgents(
     persisted.push({
       id: agent.id,
       terminalName: agent.terminalRef.name,
-      jsonlFile: agent.jsonlFile,
-      projectDir: agent.projectDir,
+      sessionId: agent.sessionId,
       folderName: agent.folderName,
     });
   }
   context.workspaceState.update(WORKSPACE_KEY_AGENTS, persisted);
 }
 
-export function restoreAgents(
+export async function restoreAgents(
   context: vscode.ExtensionContext,
   nextAgentIdRef: { current: number },
   nextTerminalIndexRef: { current: number },
   agents: Map<number, AgentState>,
-  knownJsonlFiles: Set<string>,
-  fileWatchers: Map<number, fs.FSWatcher>,
-  pollingTimers: Map<number, ReturnType<typeof setInterval>>,
-  waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
-  permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
-  jsonlPollTimers: Map<number, ReturnType<typeof setInterval>>,
-  projectScanTimerRef: { current: ReturnType<typeof setInterval> | null },
   activeAgentIdRef: { current: number | null },
   webview: vscode.Webview | undefined,
   doPersist: () => void,
-): void {
+): Promise<void> {
   const persisted = context.workspaceState.get<PersistedAgent[]>(WORKSPACE_KEY_AGENTS, []);
   if (persisted.length === 0) return;
+
+  await initDbPoller();
 
   const liveTerminals = vscode.window.terminals;
   let maxId = 0;
   let maxIdx = 0;
-  let restoredProjectDir: string | null = null;
 
   for (const p of persisted) {
     const terminal = liveTerminals.find((t) => t.name === p.terminalName);
@@ -223,10 +153,9 @@ export function restoreAgents(
     const agent: AgentState = {
       id: p.id,
       terminalRef: terminal,
-      projectDir: p.projectDir,
-      jsonlFile: p.jsonlFile,
-      fileOffset: 0,
-      lineBuffer: '',
+      sessionId: p.sessionId,
+      lastPartTime: Date.now() - RESTORE_LOOKBACK_MS,
+      lastSeenPartIds: new Set(),
       activeToolIds: new Set(),
       activeToolStatuses: new Map(),
       activeToolNames: new Map(),
@@ -239,67 +168,20 @@ export function restoreAgents(
     };
 
     agents.set(p.id, agent);
-    knownJsonlFiles.add(p.jsonlFile);
     console.log(`[Pixel Agents] Restored agent ${p.id} → terminal "${p.terminalName}"`);
 
     if (p.id > maxId) maxId = p.id;
-    // Extract terminal index from name like "Claude Code #3"
     const match = p.terminalName.match(/#(\d+)$/);
     if (match) {
       const idx = parseInt(match[1], 10);
       if (idx > maxIdx) maxIdx = idx;
     }
 
-    restoredProjectDir = p.projectDir;
-
-    // Start file watching if JSONL exists, skipping to end of file
-    try {
-      if (fs.existsSync(p.jsonlFile)) {
-        const stat = fs.statSync(p.jsonlFile);
-        agent.fileOffset = stat.size;
-        startFileWatching(
-          p.id,
-          p.jsonlFile,
-          agents,
-          fileWatchers,
-          pollingTimers,
-          waitingTimers,
-          permissionTimers,
-          webview,
-        );
-      } else {
-        // Poll for the file to appear
-        const pollTimer = setInterval(() => {
-          try {
-            if (fs.existsSync(agent.jsonlFile)) {
-              console.log(`[Pixel Agents] Restored agent ${p.id}: found JSONL file`);
-              clearInterval(pollTimer);
-              jsonlPollTimers.delete(p.id);
-              const stat = fs.statSync(agent.jsonlFile);
-              agent.fileOffset = stat.size;
-              startFileWatching(
-                p.id,
-                agent.jsonlFile,
-                agents,
-                fileWatchers,
-                pollingTimers,
-                waitingTimers,
-                permissionTimers,
-                webview,
-              );
-            }
-          } catch {
-            /* file may not exist yet */
-          }
-        }, JSONL_POLL_INTERVAL_MS);
-        jsonlPollTimers.set(p.id, pollTimer);
-      }
-    } catch {
-      /* ignore errors during restore */
+    if (p.sessionId) {
+      agent.sessionId = p.sessionId;
     }
   }
 
-  // Advance counters past restored IDs
   if (maxId >= nextAgentIdRef.current) {
     nextAgentIdRef.current = maxId + 1;
   }
@@ -307,25 +189,76 @@ export function restoreAgents(
     nextTerminalIndexRef.current = maxIdx + 1;
   }
 
-  // Re-persist cleaned-up list (removes entries whose terminals are gone)
   doPersist();
+}
 
-  // Start project scan for /clear detection
-  if (restoredProjectDir) {
-    ensureProjectScan(
-      restoredProjectDir,
-      knownJsonlFiles,
-      projectScanTimerRef,
-      activeAgentIdRef,
-      nextAgentIdRef,
-      agents,
-      fileWatchers,
-      pollingTimers,
-      waitingTimers,
-      permissionTimers,
-      webview,
-      doPersist,
+export function startPollingForRestoredAgents(
+  agents: Map<number, AgentState>,
+  waitingTimers: Map<number, ReturnType<typeof setTimeout>>,
+  permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
+  pollTimers: Map<number, ReturnType<typeof setInterval>>,
+  sessionDiscoveryTimerRef: { current: ReturnType<typeof setInterval> | null },
+  webview: vscode.Webview | undefined,
+  persistAgents: () => void,
+): void {
+  const workspaceDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+  console.log(
+    `[Pixel Agents] startPollingForRestoredAgents: ${agents.size} agents, workspaceDir="${workspaceDir}"`,
+  );
+
+  for (const [id, agent] of agents) {
+    if (pollTimers.has(id)) continue;
+
+    const bestSession = discoverMostRecentSession(workspaceDir);
+    console.log(
+      `[Pixel Agents] Agent ${id}: persisted="${agent.sessionId}", best=${bestSession ? bestSession.id : 'null'}`,
     );
+
+    if (agent.sessionId && bestSession && bestSession.id !== agent.sessionId) {
+      console.log(
+        `[Pixel Agents] Agent ${id}: replacing stale session "${agent.sessionId}" → "${bestSession.id}"`,
+      );
+      agent.sessionId = bestSession.id;
+      agent.lastPartTime = Date.now() - RESTORE_LOOKBACK_MS;
+      agent.lastSeenPartIds.clear();
+      persistAgents();
+    }
+
+    if (!agent.sessionId && bestSession) {
+      agent.sessionId = bestSession.id;
+      agent.lastPartTime = Date.now() - RESTORE_LOOKBACK_MS;
+      agent.lastSeenPartIds.clear();
+      console.log(`[Pixel Agents] Agent ${id}: discovered session ${bestSession.id}`);
+      persistAgents();
+    }
+
+    if (agent.sessionId) {
+      console.log(
+        `[Pixel Agents] Agent ${id}: starting DB polling for session "${agent.sessionId}"`,
+      );
+      startDbPolling(id, agents, waitingTimers, permissionTimers, pollTimers, webview);
+      continue;
+    }
+
+    console.log(`[Pixel Agents] Agent ${id}: no session found, starting discovery timer`);
+    const discoveryTimer = setInterval(() => {
+      if (!agents.has(id)) {
+        clearInterval(discoveryTimer);
+        return;
+      }
+      if (agent.sessionId) return;
+
+      const found = discoverMostRecentSession(workspaceDir);
+      if (found) {
+        agent.sessionId = found.id;
+        agent.lastPartTime = Date.now() - RESTORE_LOOKBACK_MS;
+        agent.lastSeenPartIds.clear();
+        console.log(`[Pixel Agents] Agent ${id}: discovered session ${found.id}`);
+        persistAgents();
+        startDbPolling(id, agents, waitingTimers, permissionTimers, pollTimers, webview);
+      }
+    }, SESSION_DISCOVERY_INTERVAL_MS);
+    sessionDiscoveryTimerRef.current = discoveryTimer;
   }
 }
 
@@ -341,12 +274,10 @@ export function sendExistingAgents(
   }
   agentIds.sort((a, b) => a - b);
 
-  // Include persisted palette/seatId from separate key
   const agentMeta = context.workspaceState.get<
     Record<string, { palette?: number; seatId?: string }>
   >(WORKSPACE_KEY_AGENT_SEATS, {});
 
-  // Include folderName per agent
   const folderNames: Record<number, string> = {};
   for (const [id, agent] of agents) {
     if (agent.folderName) {
@@ -373,7 +304,6 @@ export function sendCurrentAgentStatuses(
 ): void {
   if (!webview) return;
   for (const [agentId, agent] of agents) {
-    // Re-send active tools
     for (const [toolId, status] of agent.activeToolStatuses) {
       webview.postMessage({
         type: 'agentToolStart',
@@ -382,7 +312,6 @@ export function sendCurrentAgentStatuses(
         status,
       });
     }
-    // Re-send waiting status
     if (agent.isWaiting) {
       webview.postMessage({
         type: 'agentStatus',
